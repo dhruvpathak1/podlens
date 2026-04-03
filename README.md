@@ -1,6 +1,6 @@
 # PodLens
 
-PodLens is an AI-powered context generator for podcasts. It listens to audio, transcribes it, and automatically enriches the content by identifying key references—such as people, companies, locations, and technologies—and adding relevant images, maps, and summaries in real-time.
+PodLens is an AI-powered context generator for podcasts. It listens to audio, transcribes it, and automatically enriches the content by identifying key references such as people, companies, locations, and technologies—and adding relevant images, maps, and summaries in real-time.
 
 ## Features
 
