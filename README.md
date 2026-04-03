@@ -18,7 +18,7 @@ PodLens is an AI-powered context generator for podcasts. It listens to audio, tr
 - **React 19**
 - **TypeScript**
 - **Vite**
-- **Tailwind CSS** (if applicable, though standard CSS is used in some parts)
+- **Tailwind CSS** 
 
 ### Backend
 - **FastAPI** (Python)
