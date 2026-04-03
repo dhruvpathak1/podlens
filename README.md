@@ -42,7 +42,7 @@ PodLens is an AI-powered context generator for podcasts. It listens to audio, tr
 
 ### 1. Clone the repository
 ```bash
-git clone <repository-url>
+git clone https://github.com/dhruvpathak1/podlens
 cd podlens
 ```
 
@@ -58,6 +58,7 @@ python -m venv venv
 
 # On macOS/Linux:
 source venv/bin/activate
+
 # On Windows:
 # venv\Scripts\activate
 
@@ -74,7 +75,7 @@ cd ..
 2. Open `.env` and fill in your API keys:
    - `UNSPLASH_ACCESS_KEY`: Get one from [Unsplash Developers](https://unsplash.com/developers).
    - `ANTHROPIC_API_KEY`: (Optional) If you want to use Claude for entity extraction.
-   - `NOMINATIM_USER_AGENT`: Set this to your app name or email (e.g., `PodLens/1.0 (your@email.com)`) as per Nominatim's usage policy.
+   - `NOMINATIM_USER_AGENT`: Set this to your app name or email
 
 ## Running the App
 
