@@ -95,7 +95,7 @@ export function EntitySourceCard({ card, formatTimeRange }: Props) {
           </section>
         ) : null}
 
-        {showMap && (
+        {showMap && card.location ? (
           <section className="entity-source-card__block">
             <h4 className="entity-source-card__label">Map</h4>
             <p className="entity-source-card__geo">{card.location.display_name}</p>
@@ -115,7 +115,7 @@ export function EntitySourceCard({ card, formatTimeRange }: Props) {
               OpenStreetMap →
             </a>
           </section>
-        )}
+        ) : null}
       </div>
 
       {!card.wikipedia && !showMap && !card.unsplash && (

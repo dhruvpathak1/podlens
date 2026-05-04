@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AudioDropZone } from './components/AudioDropZone'
 import { MiniAudioPlayer, type MiniAudioPlayerHandle } from './components/MiniAudioPlayer'
-import { transcribeAudio, type TranscriptSegment } from './lib/transcribeAudio'
+import {
+  transcribeAudio,
+  transcribeLiveAudioChunk,
+  type TranscriptSegment,
+} from './lib/transcribeAudio'
+import { LIVE_CHUNK_INTERVAL_MS, useLiveMicRecorder } from './lib/useLiveMicRecorder'
+import { mergeEntityDocuments, mergeTranscriptSegments } from './lib/liveSessionMerge'
 import { EntitySourceCard } from './components/EntitySourceCard'
 import { enrichEntityCards, type EnrichedEntityCard } from './lib/enrichEntities'
 import type { EntityDocument, EntityRecord } from './lib/extractEntities'
@@ -16,6 +22,7 @@ import './App.css'
 const PODLENS_TITLE = 'PodLens'
 
 type JobState = 'idle' | 'transcribing' | 'enriching'
+type SessionMode = 'file' | 'live'
 
 const ENTITY_TYPE_FILTER_OPTIONS = [
   'ALL',
@@ -95,6 +102,16 @@ export default function App() {
   const feedRef = useRef<HTMLDivElement>(null)
   const prevActivePlayIdRef = useRef<string | null>(null)
   const prevLiveActiveKeysRef = useRef<Set<string>>(new Set())
+  const sessionStartMsRef = useRef<number | null>(null)
+  const chunkChainRef = useRef(Promise.resolve())
+  const [sessionMode, setSessionMode] = useState<SessionMode>('file')
+  const [liveProcessing, setLiveProcessing] = useState(false)
+  const [liveChunkError, setLiveChunkError] = useState<string | null>(null)
+  const enrichedCardsRef = useRef<EnrichedEntityCard[]>([])
+
+  useEffect(() => {
+    enrichedCardsRef.current = enrichedCards
+  }, [enrichedCards])
 
   useEffect(() => {
     document.title = PODLENS_TITLE
@@ -105,6 +122,125 @@ export default function App() {
   const viteEntityBackend = import.meta.env.VITE_ENTITY_BACKEND
   const entityBackendOption =
     viteEntityBackend === 'spacy' || viteEntityBackend === 'claude' ? viteEntityBackend : undefined
+
+  const queueLiveChunk = useCallback(
+    (blob: Blob, chunkIndex: number) => {
+      chunkChainRef.current = chunkChainRef.current.then(async () => {
+        setLiveProcessing(true)
+        setLiveChunkError(null)
+        try {
+          const secPerChunk = LIVE_CHUNK_INTERVAL_MS / 1000
+          const res = await transcribeLiveAudioChunk(blob, {
+            chunkSeq: chunkIndex,
+            timeOffsetSec: chunkIndex * secPerChunk,
+            backend: entityBackendOption,
+          })
+
+          const piece = res.transcript.trim()
+          if (piece) {
+            setTranscript((prev) => (prev ? `${prev} ${piece}`.trim() : piece))
+          }
+          if (res.segments.length) {
+            setSegments((prev) => mergeTranscriptSegments(prev, res.segments))
+          }
+          const mergedDoc = res.document ?? null
+          if (mergedDoc) {
+            setEntityDoc((prev) => mergeEntityDocuments(prev, mergedDoc))
+          }
+          if (res.entityError) {
+            setEntityError(res.entityError)
+          }
+
+          const doc = mergedDoc
+          if (doc?.entities?.length) {
+            const keys = new Set(enrichedCardsRef.current.map((c) => entityMatchKey(c.type, c.text)))
+            const novelRaw = doc.entities.filter((e) => !keys.has(entityMatchKey(e.type, e.text)))
+            const seenLocal = new Set<string>()
+            const novelUnique = novelRaw.filter((e) => {
+              const k = entityMatchKey(e.type, e.text)
+              if (seenLocal.has(k)) return false
+              seenLocal.add(k)
+              return true
+            })
+            if (novelUnique.length) {
+              try {
+                const r = await enrichEntityCards(novelUnique)
+                setEnrichedCards((p) => {
+                  const k = new Set(p.map((c) => entityMatchKey(c.type, c.text)))
+                  const add = r.cards.filter((c) => !k.has(entityMatchKey(c.type, c.text)))
+                  const next = [...p, ...add]
+                  enrichedCardsRef.current = next
+                  return next
+                })
+                setUnsplashHint((u) => u ?? r.unsplash_enabled ?? null)
+              } catch (e) {
+                setEnrichError(e instanceof Error ? e.message : 'Enrichment failed')
+              }
+            }
+          }
+        } catch (e) {
+          setLiveChunkError(e instanceof Error ? e.message : 'Live transcription failed')
+        } finally {
+          setLiveProcessing(false)
+        }
+      })
+    },
+    [entityBackendOption]
+  )
+
+  const liveMic = useLiveMicRecorder({ onChunk: queueLiveChunk })
+
+  const handleStartLiveSession = useCallback(() => {
+    chunkChainRef.current = Promise.resolve()
+    sessionStartMsRef.current = Date.now()
+    setSessionMode('live')
+    liveMic.clearMicError()
+    setLiveChunkError(null)
+    setFile(null)
+    setError(null)
+    setTranscript(null)
+    setSegments([])
+    setSavedPath(null)
+    setSelectedSentence(null)
+    setEntityDoc(null)
+    setEntitySavedPath(null)
+    setEntityError(null)
+    setEnrichedCards([])
+    enrichedCardsRef.current = []
+    setEnrichError(null)
+    setUnsplashHint(null)
+    setEntityTypeFilter('ALL')
+    setLiveRollingCards([])
+    prevLiveActiveKeysRef.current = new Set()
+    setPlaybackTime(0)
+    setPlaybackDuration(0)
+    void liveMic.start()
+  }, [liveMic])
+
+  const handleStopLiveSession = useCallback(() => {
+    const start = sessionStartMsRef.current
+    sessionStartMsRef.current = null
+    liveMic.stop()
+    if (start != null) {
+      const elapsed = Math.max(0, (Date.now() - start) / 1000)
+      setPlaybackTime(elapsed)
+      setPlaybackDuration(elapsed)
+    }
+  }, [liveMic])
+
+  const handleFileSelected = useCallback(
+    (f: File | null) => {
+      if (f) {
+        setSessionMode('file')
+        sessionStartMsRef.current = null
+        if (liveMic.active) {
+          liveMic.stop()
+        }
+      }
+      setFile(f)
+    },
+    [liveMic]
+  )
 
   const entityFilterCounts = useMemo(() => {
     if (!entityDoc?.entities.length) return null
@@ -156,7 +292,7 @@ export default function App() {
   }, [enrichedCards])
 
   useEffect(() => {
-    if (!audioUrl) return
+    if (!audioUrl && sessionMode !== 'live') return
     if (liveEntitySource.length === 0) {
       prevLiveActiveKeysRef.current = new Set()
       return
@@ -184,7 +320,7 @@ export default function App() {
       while (next.length > LIVE_QUEUE_MAX) next.shift()
       return next
     })
-  }, [audioUrl, liveActiveEntities, liveEntitySource.length, enrichedCards])
+  }, [audioUrl, sessionMode, liveActiveEntities, liveEntitySource.length, enrichedCards])
 
   useEffect(() => {
     if (!file) {
@@ -229,11 +365,13 @@ export default function App() {
     setEntitySavedPath(null)
     setEntityError(null)
     setEnrichedCards([])
+    enrichedCardsRef.current = []
     setEnrichError(null)
     setUnsplashHint(null)
     setEntityTypeFilter('ALL')
     setLiveRollingCards([])
     prevLiveActiveKeysRef.current = new Set()
+    setSessionMode('file')
     setJob('transcribing')
     try {
       const {
@@ -258,6 +396,7 @@ export default function App() {
         try {
           const res = await enrichEntityCards(doc.entities)
           setEnrichedCards(res.cards)
+          enrichedCardsRef.current = res.cards
           setUnsplashHint(res.unsplash_enabled ?? null)
         } catch (e) {
           setEnrichError(e instanceof Error ? e.message : 'Enrichment failed')
@@ -265,6 +404,7 @@ export default function App() {
         }
       } else {
         setEnrichedCards([])
+        enrichedCardsRef.current = []
         setUnsplashHint(null)
       }
     } catch (e) {
@@ -274,14 +414,19 @@ export default function App() {
     }
   }, [file, busy, entityBackendOption])
 
-  const statusLabel =
-    job === 'transcribing'
-      ? 'Transcribing…'
-      : job === 'enriching'
-        ? 'Fetching sources…'
-        : transcript
-          ? 'Synced'
-          : 'Ready'
+  const liveListening = liveMic.active
+
+  const statusLabel = liveProcessing
+    ? 'Live · transcribing chunk…'
+    : liveListening
+      ? 'Live · listening…'
+      : job === 'transcribing'
+        ? 'Transcribing…'
+        : job === 'enriching'
+          ? 'Fetching sources…'
+          : transcript
+            ? 'Synced'
+            : 'Ready'
   const hasTimedSentences = allSentences.some((s) => s.start > 0 || s.end > 0)
 
   const activePlaySentenceId = useMemo(() => {
@@ -293,6 +438,19 @@ export default function App() {
     setPlaybackTime(t)
     setPlaybackDuration(d)
   }, [])
+
+  useEffect(() => {
+    if (sessionMode !== 'live' || !liveListening) return
+    const start = sessionStartMsRef.current
+    if (start == null) return
+    const tick = () => {
+      const elapsed = Math.max(0, (Date.now() - start) / 1000)
+      handlePlaybackTick(elapsed, elapsed)
+    }
+    tick()
+    const id = window.setInterval(tick, 250)
+    return () => window.clearInterval(id)
+  }, [sessionMode, liveListening, handlePlaybackTick])
 
   useEffect(() => {
     if (!hasTimedSentences || !activePlaySentenceId) return
@@ -308,8 +466,10 @@ export default function App() {
 
   const selectSentence = useCallback((s: TimestampedSentence) => {
     setSelectedSentence(s)
-    playerRef.current?.seekTo(s.start)
-  }, [])
+    if (sessionMode !== 'live') {
+      playerRef.current?.seekTo(s.start)
+    }
+  }, [sessionMode])
 
   const onSentenceClick = useCallback(
     (s: TimestampedSentence) => {
@@ -335,7 +495,9 @@ export default function App() {
           <div className="transcript-sidebar__head">
             <div className="transcript-sidebar__titles">
               <h2 className="transcript-sidebar__label">Live transcript</h2>
-              <p className={`transcript-sidebar__status${busy ? ' transcript-sidebar__status--busy' : ''}`}>
+              <p
+                className={`transcript-sidebar__status${busy || liveProcessing ? ' transcript-sidebar__status--busy' : ''}`}
+              >
                 <span className="transcript-sidebar__status-dot" aria-hidden />
                 {statusLabel}
               </p>
@@ -372,12 +534,12 @@ export default function App() {
           )}
 
           <div className="transcript-sidebar__ingest">
-            <AudioDropZone file={file} onFileChange={setFile} disabled={busy} compact />
+            <AudioDropZone file={file} onFileChange={handleFileSelected} disabled={busy || liveMic.active} compact />
 
             <button
               type="button"
               className="btn btn--primary btn--block btn--podlens"
-              disabled={!file || busy}
+              disabled={!file || busy || liveMic.active}
               onClick={runPodLens}
             >
               {job === 'transcribing'
@@ -386,12 +548,47 @@ export default function App() {
                   ? 'Fetching Wikipedia, maps & photos…'
                   : 'PodLens'}
             </button>
+
+            <div className="transcript-sidebar__live" aria-label="Live microphone session">
+              <p className="transcript-sidebar__live-lead">
+                Capture from your microphone: each {LIVE_CHUNK_INTERVAL_MS / 1000}-second slice is sent to the API for
+                Whisper transcription, tagging, and enrichment — same pipeline as uploaded audio.
+              </p>
+              {!liveMic.active ? (
+                <button
+                  type="button"
+                  className="btn btn--ghost btn--block transcript-sidebar__live-btn"
+                  onClick={handleStartLiveSession}
+                  disabled={busy}
+                >
+                  Start live listening
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn btn--ghost btn--block transcript-sidebar__live-btn transcript-sidebar__live-btn--stop"
+                  onClick={handleStopLiveSession}
+                >
+                  Stop listening
+                </button>
+              )}
+              {liveMic.micError ? (
+                <p className="transcript-sidebar__live-mic-err" role="alert">
+                  {liveMic.micError}
+                </p>
+              ) : null}
+            </div>
           </div>
 
           <MiniAudioPlayer
             key={audioUrl ?? 'no-audio'}
             ref={playerRef}
             src={audioUrl}
+            emptyHint={
+              sessionMode === 'live'
+                ? 'Live mode follows the timeline from your microphone — no file playback.'
+                : null
+            }
             onPlaybackTick={handlePlaybackTick}
           />
 
@@ -410,6 +607,12 @@ export default function App() {
           {enrichError && (
             <div className="alert alert--error" role="alert">
               {enrichError}
+            </div>
+          )}
+
+          {liveChunkError && (
+            <div className="alert alert--error" role="alert">
+              {liveChunkError}
             </div>
           )}
 
@@ -459,7 +662,10 @@ export default function App() {
               })}
 
             {!busy && !transcript && !error && (
-              <p className="transcript-sidebar__empty">Run <strong>PodLens</strong> to transcribe and load tags here.</p>
+              <p className="transcript-sidebar__empty">
+                Run <strong>PodLens</strong> on a file, or <strong>Start live listening</strong> for microphone capture
+                every {LIVE_CHUNK_INTERVAL_MS / 1000}s.
+              </p>
             )}
 
             {!busy && transcript && visibleSentences.length === 0 && searchQuery && (
@@ -487,7 +693,7 @@ export default function App() {
                     <span className="live-workspace__pulse" aria-hidden />
                     Live
                   </h2>
-                  {audioUrl ? (
+                  {audioUrl || sessionMode === 'live' ? (
                     <time
                       className="live-workspace__clock"
                       dateTime={`PT${Math.floor(playbackTime)}S`}
@@ -500,7 +706,7 @@ export default function App() {
                   ) : null}
                 </div>
                 <div className="live-workspace__body" aria-live="polite">
-                  {!audioUrl ? (
+                  {!audioUrl && sessionMode !== 'live' ? (
                     <p className="live-workspace__hint">
                       Load audio and press play — up to three source cards queue here as each new mention{' '}
                       <strong>starts</strong>; the oldest drops off when a fourth begins.
@@ -511,8 +717,11 @@ export default function App() {
                     </p>
                   ) : liveRollingCards.length === 0 ? (
                     <p className="live-workspace__hint">
-                      Play the audio — full cards appear when a tagged mention begins. Up to {LIVE_QUEUE_MAX} stay on
-                      screen; older ones roll off automatically.
+                      {sessionMode === 'live' && !audioUrl
+                        ? liveListening
+                          ? `Listening — the timeline follows recording time; source cards appear when tagged mentions fall on that timeline (updates every ${LIVE_CHUNK_INTERVAL_MS / 1000}s).`
+                          : 'Stopped — scrub the transcript on the left or start listening again; cards appear when mentions align with the frozen timeline.'
+                        : `Play the audio — full cards appear when a tagged mention begins. Up to ${LIVE_QUEUE_MAX} stay on screen; older ones roll off automatically.`}
                     </p>
                   ) : (
                     <div className="live-workspace__cards" aria-label="Live rolling source cards">

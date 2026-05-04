@@ -132,6 +132,34 @@ def get_model():
     return _model
 
 
+def _whisper_transcribe_file(tmp_path: str, language: str | None) -> tuple[str, list[dict]]:
+    model = get_model()
+    opts: dict = {}
+    if language and language.strip():
+        opts["language"] = language.strip()
+    result = model.transcribe(tmp_path, **opts)
+    text = (result.get("text") or "").strip()
+    segments = _segments_from_result(result)
+    return text, segments
+
+
+def _offset_segment_ids_and_times(segments: list[dict], *, time_offset_sec: float, chunk_seq: int) -> list[dict]:
+    """Stable IDs across a live session: chunk_seq * 1000 + index; shift times into session timeline."""
+    off = float(time_offset_sec)
+    base = max(0, int(chunk_seq)) * 1000
+    out: list[dict] = []
+    for i, seg in enumerate(segments):
+        out.append(
+            {
+                "id": base + i,
+                "start": float(seg["start"]) + off,
+                "end": float(seg["end"]) + off,
+                "text": seg["text"],
+            }
+        )
+    return out
+
+
 @app.post("/api/transcribe")
 async def transcribe(
     audio: UploadFile = File(...),
@@ -155,14 +183,7 @@ async def transcribe(
             tmp_path = tmp.name
             tmp.write(contents)
 
-        model = get_model()
-        opts: dict = {}
-        if language and language.strip():
-            opts["language"] = language.strip()
-
-        result = model.transcribe(tmp_path, **opts)
-        text = (result.get("text") or "").strip()
-        segments = _segments_from_result(result)
+        text, segments = _whisper_transcribe_file(tmp_path, language)
 
         TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
         ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -206,6 +227,97 @@ async def transcribe(
         raise
     except Exception as e:
         logger.exception("transcribe failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    finally:
+        if tmp_path and os.path.isfile(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+@app.post("/api/transcribe-chunk")
+async def transcribe_chunk(
+    audio: UploadFile = File(...),
+    time_offset_sec: float = Form(0.0),
+    chunk_seq: int = Form(0),
+    language: str | None = Form(None),
+    extract_entities: bool = Form(True),
+    entity_backend: str | None = Form(None),
+    persist_transcript: bool = Form(False),
+):
+    """Transcribe one timed slice (e.g. 20s of live mic). Times are shifted into a session timeline."""
+    if not audio.filename:
+        raise HTTPException(status_code=400, detail="Missing file name")
+
+    suffix = Path(audio.filename).suffix.lower()
+    if suffix not in {".mp3", ".wav", ".m4a", ".webm", ".ogg", ".flac", ".mp4", ".mpeg", ".mpga"}:
+        suffix = ".webm"
+
+    tmp_path: str | None = None
+    try:
+        contents = await audio.read()
+        if not contents:
+            raise HTTPException(status_code=400, detail="Empty file")
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+            tmp.write(contents)
+
+        text, raw_segments = _whisper_transcribe_file(tmp_path, language)
+        segments = _offset_segment_ids_and_times(
+            raw_segments, time_offset_sec=time_offset_sec, chunk_seq=chunk_seq
+        )
+
+        saved_path: str | None = None
+        if persist_transcript and segments:
+            TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            stem = _safe_audio_stem(audio.filename or "live_chunk")
+            out_name = f"{stem}_chunk{chunk_seq}_{ts}.txt"
+            out_path = TRANSCRIPTS_DIR / out_name
+            out_path.write_text(_transcript_file_body(text, segments), encoding="utf-8")
+            saved_path = str(out_path.resolve())
+
+        document: dict | None = None
+        entity_saved_path: str | None = None
+        entity_error: str | None = None
+        if extract_entities and segments:
+            backend = resolve_entity_backend(entity_backend)
+            chunks_dict = [
+                {"id": s["id"], "start": s["start"], "end": s["end"], "text": s["text"]} for s in segments
+            ]
+            try:
+                normalized, entities = run_extraction(chunks_dict, backend=backend)
+                label = f"{audio.filename or 'live'}#chunk{chunk_seq}"
+                doc = build_document(
+                    chunks=normalized,
+                    entities=entities,
+                    source_label=label,
+                    backend=backend,
+                )
+                document = doc
+                if persist_transcript:
+                    base = audio.filename or "live_chunk"
+                    path = save_document(doc, ENTITY_JSON_DIR, _safe_audio_stem(base))
+                    entity_saved_path = str(path)
+            except Exception as e:
+                logger.exception("entity extraction after transcribe-chunk failed")
+                entity_error = str(e)
+
+        return {
+            "transcript": text,
+            "segments": segments,
+            "saved_path": saved_path,
+            "document": document,
+            "entity_saved_path": entity_saved_path,
+            "entity_error": entity_error,
+            "chunk_seq": int(chunk_seq),
+            "time_offset_sec": float(time_offset_sec),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("transcribe-chunk failed")
         raise HTTPException(status_code=500, detail=str(e)) from e
     finally:
         if tmp_path and os.path.isfile(tmp_path):

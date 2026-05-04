@@ -124,6 +124,88 @@ function formatErrorDetail(j: unknown): string | null {
   return null
 }
 
+export type LiveChunkTranscribeOptions = TranscribeOptions & {
+  /** Monotonic index for stable segment IDs server-side (chunk_seq). */
+  chunkSeq: number
+  /** Seconds to add to Whisper segment times so chunks align on a session timeline. */
+  timeOffsetSec: number
+  /** When true, server writes transcript / entity JSON to disk (default false). */
+  persistTranscript?: boolean
+}
+
+function resolveChunkEndpoint(explicit?: string): string {
+  const transcribeRoot = resolveEndpoint(explicit)
+  return transcribeRoot.replace(/\/transcribe$/i, '/transcribe-chunk')
+}
+
+/**
+ * Transcribe one live microphone slice (e.g. 20s WebM). Same response shape as {@link transcribeAudio}.
+ */
+export async function transcribeLiveAudioChunk(
+  blob: Blob,
+  options: LiveChunkTranscribeOptions
+): Promise<TranscribeResult> {
+  const endpoint = resolveChunkEndpoint(options.endpoint)
+  const body = new FormData()
+  body.append('audio', blob, `live-chunk-${options.chunkSeq}.webm`)
+  body.append('chunk_seq', String(options.chunkSeq))
+  body.append('time_offset_sec', String(options.timeOffsetSec))
+  body.append('extract_entities', options.extractEntities === false ? 'false' : 'true')
+  body.append('persist_transcript', options.persistTranscript === true ? 'true' : 'false')
+  if (options.language) body.append('language', options.language)
+  if (options.backend) body.append('entity_backend', options.backend)
+
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    body,
+  })
+
+  const ct = res.headers.get('content-type') ?? ''
+
+  if (!res.ok) {
+    let detail = res.statusText
+    try {
+      if (ct.includes('application/json')) {
+        const j = await res.json()
+        if (j && typeof j === 'object' && typeof (j as { error?: string }).error === 'string') {
+          detail = (j as { error: string }).error
+        } else if (j && typeof j === 'object' && typeof (j as { message?: string }).message === 'string') {
+          detail = (j as { message: string }).message
+        } else {
+          const fromDetail = formatErrorDetail(j)
+          if (fromDetail) detail = fromDetail
+        }
+      } else {
+        const t = await res.text()
+        if (t) detail = t.slice(0, 500)
+      }
+    } catch {
+      /* keep */
+    }
+    throw new Error(detail || `Request failed (${res.status})`)
+  }
+
+  if (ct.includes('application/json')) {
+    const data = await res.json()
+    const text = pickTranscriptFromJson(data)
+    if (text != null) {
+      return {
+        transcript: text.trim(),
+        segments: pickSegmentsFromJson(data),
+        savedPath: pickSavedPathFromJson(data),
+        document: pickDocumentFromJson(data),
+        entitySavedPath: pickEntitySavedPathFromJson(data),
+        entityError: pickEntityErrorFromJson(data),
+      }
+    }
+    throw new Error('Response JSON did not include transcript text')
+  }
+
+  const text = await res.text()
+  if (!text.trim()) throw new Error('Empty transcript response')
+  return { transcript: text.trim(), segments: [] }
+}
+
 export async function transcribeAudio(
   file: File,
   options: TranscribeOptions = {}

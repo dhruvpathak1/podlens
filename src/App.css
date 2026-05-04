@@ -141,6 +141,34 @@
   flex-shrink: 0;
 }
 
+.transcript-sidebar__live {
+  margin-top: 1rem;
+  padding-top: 0.85rem;
+  border-top: 1px dashed var(--border);
+}
+
+.transcript-sidebar__live-lead {
+  margin: 0 0 0.65rem;
+  font-size: 0.72rem;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.transcript-sidebar__live-btn {
+  margin-top: 0;
+}
+
+.transcript-sidebar__live-btn--stop {
+  border-color: rgba(200, 90, 90, 0.45);
+  color: #c96b6b;
+}
+
+.transcript-sidebar__live-mic-err {
+  margin: 0.5rem 0 0;
+  font-size: 0.76rem;
+  color: var(--err-text);
+}
+
 /* Compact audio player (under ingest) */
 .mini-player {
   display: flex;

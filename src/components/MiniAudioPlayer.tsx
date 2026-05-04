@@ -10,6 +10,8 @@ type Props = {
   src: string | null
   /** Fired on time updates, after seeks/scrubs, and when duration is known */
   onPlaybackTick?: (currentTime: number, duration: number) => void
+  /** Override default hint when there is no `src` (e.g. live microphone mode). */
+  emptyHint?: string | null
 }
 
 function formatClock(sec: number): string {
@@ -26,7 +28,7 @@ function formatClock(sec: number): string {
 }
 
 export const MiniAudioPlayer = forwardRef<MiniAudioPlayerHandle, Props>(function MiniAudioPlayer(
-  { src, onPlaybackTick },
+  { src, onPlaybackTick, emptyHint },
   ref
 ) {
   const audioRef = useRef<HTMLAudioElement>(null)
@@ -99,9 +101,10 @@ export const MiniAudioPlayer = forwardRef<MiniAudioPlayerHandle, Props>(function
   )
 
   if (!src) {
+    const hint = emptyHint?.trim() || 'Add an audio file to enable playback'
     return (
       <div className="mini-player mini-player--empty" aria-live="polite">
-        <span className="mini-player__hint">Add an audio file to enable playback</span>
+        <span className="mini-player__hint">{hint}</span>
       </div>
     )
   }
